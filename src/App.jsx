@@ -7,6 +7,8 @@ import LoadingState from './components/LoadingState';
 import EmptyState from './components/EmptyState';
 import ErrorState from './components/ErrorState';
 import InitialState from './components/InitialState';
+import AuthModal from './components/auth/AuthModal';
+import { AuthProvider, useAuth } from './context/AuthContext';
 import { searchShows } from './services/tvmaze';
 
 /**
@@ -18,7 +20,7 @@ function getInitialQueryFromUrl() {
   return params.get('q') || '';
 }
 
-export default function App() {
+function AppContent() {
   // 1. Core State
   const [query, setQuery] = useState(() => getInitialQueryFromUrl());
   const [lastSearchedQuery, setLastSearchedQuery] = useState('');
@@ -27,6 +29,8 @@ export default function App() {
   const [error, setError] = useState(null);
   const [selectedShow, setSelectedShow] = useState(null);
   const [validationMessage, setValidationMessage] = useState('');
+
+  const { authNotification } = useAuth();
 
   // 2. Ref to handle in-flight request cancellation (prevents race conditions)
   const abortControllerRef = useRef(null);
@@ -59,28 +63,25 @@ export default function App() {
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
-    // Sync URL with URLSearchParams
-    try {
-      const url = new URL(window.location.href);
-      url.searchParams.set('q', trimmed);
-      window.history.pushState({ query: trimmed }, '', url.toString());
-    } catch {
-      // Fallback if URL API not supported
-    }
-
     try {
       const results = await searchShows(trimmed, controller.signal);
       setShows(results);
-      setError(null);
+
+      // Synchronize browser URL without reloading page
+      const currentUrl = new URL(window.location.href);
+      if (currentUrl.searchParams.get('q') !== trimmed) {
+        currentUrl.searchParams.set('q', trimmed);
+        window.history.pushState({ query: trimmed }, '', currentUrl.toString());
+      }
     } catch (err) {
-      // Ignore AbortError caused by superseding searches
+      // Ignore AbortError caused by intentional user cancellation / newer search
       if (err.name === 'AbortError') {
         return;
       }
-      setError(err.message || 'Failed to fetch TV series. Please try again.');
-      setShows(null);
+      setError(err.message || 'An unexpected error occurred.');
+      setShows([]);
     } finally {
-      // Ensure loading state is always reset when this controller completes
+      // Only reset loading if this request is still the active one
       if (abortControllerRef.current === controller) {
         setLoading(false);
       }
@@ -88,41 +89,63 @@ export default function App() {
   }, []);
 
   /**
-   * Handles user input changes.
-   * Clears obsolete validation message as soon as user types.
+   * Handles search form submission.
    */
-  const handleQueryChange = (val) => {
-    setQuery(val);
-    if (validationMessage) {
-      setValidationMessage('');
-    }
-    if (error) {
-      setError(null);
-    }
-  };
+  const handleFormSubmit = useCallback(
+    (e) => {
+      if (e?.preventDefault) {
+        e.preventDefault();
+      }
+      executeSearch(query);
+    },
+    [executeSearch, query]
+  );
 
   /**
-   * Form submission trigger.
-   * Prevents duplicate submission while loading.
+   * Updates input state and clears validation error on typing.
    */
-  const handleFormSubmit = () => {
-    if (loading) return;
-    executeSearch(query);
-  };
+  const handleQueryChange = useCallback(
+    (newQuery) => {
+      setQuery(newQuery);
+      if (validationMessage) {
+        setValidationMessage('');
+      }
+    },
+    [validationMessage]
+  );
 
   /**
-   * Clears the input field.
+   * Clears search input box.
    */
-  const handleClearInput = () => {
+  const handleClearInput = useCallback(() => {
     setQuery('');
     setValidationMessage('');
-  };
+  }, []);
 
   /**
-   * Resets entire application to initial state.
+   * Handles user selecting a suggestion tag.
    */
-  const handleReset = () => {
-    // Abort pending request if any
+  const handleSelectSuggestion = useCallback(
+    (suggestionText) => {
+      setQuery(suggestionText);
+      executeSearch(suggestionText);
+    },
+    [executeSearch]
+  );
+
+  /**
+   * Retries the last failed search query.
+   */
+  const handleRetry = useCallback(() => {
+    if (lastSearchedQuery) {
+      executeSearch(lastSearchedQuery);
+    }
+  }, [executeSearch, lastSearchedQuery]);
+
+  /**
+   * Resets entire application to clean initial state.
+   */
+  const handleReset = useCallback(() => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
     }
@@ -134,58 +157,37 @@ export default function App() {
     setSelectedShow(null);
     setValidationMessage('');
 
-    // Clear URL query params
-    try {
-      const url = new URL(window.location.href);
-      url.searchParams.delete('q');
-      window.history.pushState({}, '', url.pathname);
-    } catch {
-      // Ignore
+    // Reset URL query parameter
+    const currentUrl = new URL(window.location.href);
+    if (currentUrl.searchParams.has('q')) {
+      currentUrl.searchParams.delete('q');
+      window.history.pushState({}, '', currentUrl.pathname);
     }
-  };
+  }, []);
 
   /**
-   * Handles selecting a quick suggestion chip.
+   * Effect: Handles browser navigation (Back / Forward buttons).
    */
-  const handleSelectSuggestion = (suggestionTerm) => {
-    setQuery(suggestionTerm);
-    executeSearch(suggestionTerm);
-  };
-
-  /**
-   * Retries the previous search query upon error.
-   */
-  const handleRetry = () => {
-    if (lastSearchedQuery) {
-      executeSearch(lastSearchedQuery);
-    } else if (query.trim()) {
-      executeSearch(query);
-    }
-  };
-
-  // Initial mount: perform search if initial URL has ?q=...
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const initialQuery = params.get('q');
-    if (initialQuery && initialQuery.trim()) {
-      setTimeout(() => {
-        executeSearch(initialQuery.trim());
-      }, 0);
-    }
-
-    // Handle browser back/forward buttons
     const handlePopState = () => {
-      const currentParams = new URLSearchParams(window.location.search);
-      const q = currentParams.get('q');
-      if (q && q.trim()) {
-        setQuery(q.trim());
-        executeSearch(q.trim());
+      const currentQuery = getInitialQueryFromUrl();
+      setQuery(currentQuery);
+      if (currentQuery) {
+        executeSearch(currentQuery);
       } else {
-        handleReset();
+        setShows(null);
+        setLastSearchedQuery('');
       }
     };
 
     window.addEventListener('popstate', handlePopState);
+
+    // Initial search if query parameter exists on first page load
+    const initialQuery = getInitialQueryFromUrl();
+    if (initialQuery) {
+      executeSearch(initialQuery);
+    }
+
     return () => {
       window.removeEventListener('popstate', handlePopState);
       if (abortControllerRef.current) {
@@ -196,6 +198,16 @@ export default function App() {
 
   return (
     <div className="app-layout">
+      {/* Toast Notification */}
+      {authNotification && (
+        <div className={`auth-toast auth-toast-${authNotification.type}`} role="status">
+          <span className="toast-icon">
+            {authNotification.type === 'success' ? '✓' : 'ℹ'}
+          </span>
+          <span>{authNotification.message}</span>
+        </div>
+      )}
+
       {/* 1. Header */}
       <Header onReset={handleReset} />
 
@@ -262,6 +274,9 @@ export default function App() {
         />
       )}
 
+      {/* 5. Auth Modal (Login / Register) */}
+      <AuthModal />
+
       {/* Footer */}
       <footer className="app-footer">
         <div className="footer-container">
@@ -274,5 +289,13 @@ export default function App() {
         </div>
       </footer>
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <AppContent />
+    </AuthProvider>
   );
 }
